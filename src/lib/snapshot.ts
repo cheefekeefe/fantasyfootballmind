@@ -33,12 +33,11 @@ import { avatarUrl } from "./sources/sleeper";
 import type { DpPickRow, DpPlayerRow, FantasyCalcRow, IdMapRow } from "./sources/values";
 import { dpValueFromEcr } from "./sources/values";
 import type { EspnProjection } from "./sources/espn";
-import type { GameLine, PlayerProp } from "./sources/odds";
+import type { PlayerProp } from "./sources/odds";
 import type { FpRankRow } from "./sources/fantasypros";
 import { leaguePoints, scoreStats } from "./engine/scoring";
 import { vegasStatLine } from "./engine/props";
 import { buildConsensus, rankToPoints } from "./engine/consensus";
-import { impliedTeamTotal } from "./sources/nflverse";
 import { normName, normTeam } from "./teams";
 import { isStartingSlot } from "./engine/lineup";
 
@@ -62,7 +61,6 @@ export interface RawInputs {
   idMap?: IdMapRow[];
   schedule?: NflGame[];
   usage?: { byGsis: Record<string, UsageTrend>; snapsByPfr: Record<string, { pct: number; last3: number }> };
-  gameLines?: GameLine[];
   props?: PlayerProp[];
   fpWeekly?: FpRankRow[];
   sources: SourceStatus[];
@@ -153,28 +151,6 @@ export function buildSnapshot(raw: RawInputs, now = new Date()): LeagueSnapshot 
   // ---- NFL schedule, byes, Vegas game lines ---------------------------------------------
   const nflGames: Record<string, NflGame> = {};
   for (const g of raw.schedule ?? []) nflGames[`${g.week}:${g.team}`] = g;
-  for (const gl of raw.gameLines ?? []) {
-    // Live Odds API lines override nflverse for the current week.
-    for (const [team, opp, isHome] of [
-      [gl.home, gl.away, true],
-      [gl.away, gl.home, false],
-    ] as [string, string, boolean][]) {
-      const key = `${week}:${team}`;
-      const spread = gl.homeSpread === null ? null : isHome ? gl.homeSpread : -gl.homeSpread;
-      if (nflGames[key] || raw.schedule === undefined) {
-        nflGames[key] = {
-          week,
-          team,
-          opponent: opp,
-          home: isHome,
-          kickoff: gl.kickoff,
-          spread,
-          total: gl.total,
-          impliedTotal: impliedTeamTotal(gl.total, spread),
-        };
-      }
-    }
-  }
   const teamsWithGames = new Map<string, Set<number>>();
   for (const g of Object.values(nflGames)) {
     if (!teamsWithGames.has(g.team)) teamsWithGames.set(g.team, new Set());
@@ -506,7 +482,8 @@ const round1 = (x: number) => Math.round(x * 10) / 10;
  */
 function buildPicks(raw: RawInputs, league: LeagueSettings): Map<number, DraftPick[]> {
   const out = new Map<number, DraftPick[]>();
-  if (league.type === "redraft") return out;
+  // Built for every league type: a redraft-typed Sleeper league may run keepers manually
+  // (see the format override in the UI); the redraft engine simply values picks at zero.
   const seasons = new Set<number>();
   const currentDraft = raw.drafts.find((d) => Number(d.season) === league.season);
   if (currentDraft && currentDraft.status !== "complete") seasons.add(league.season);

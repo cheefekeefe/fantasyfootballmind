@@ -26,6 +26,18 @@ interface FetchOpts {
   /** Persist to .cache/ so restarts don't re-spend credits (Odds API) or re-download big files. */
   disk?: boolean;
   parse?: "json" | "text";
+  /** Only return a cached response; never hit the network (throws on a miss). */
+  cacheOnly?: boolean;
+  /** Ignore any cached response and re-fetch. */
+  force?: boolean;
+  /** Inspect the raw response (e.g. rate-limit / credit headers). */
+  onResponse?: (res: Response) => void;
+}
+
+export class CacheMiss extends Error {
+  constructor() {
+    super("not cached");
+  }
 }
 
 function cacheKey(url: string, headers?: Record<string, string>) {
@@ -36,11 +48,11 @@ export async function cachedFetch<T = unknown>(url: string, opts: FetchOpts): Pr
   const key = cacheKey(url, opts.headers);
   const now = Date.now();
   const hit = memory.get(key);
-  if (hit && hit.expires > now) return hit.value as T;
+  if (!opts.force && hit && hit.expires > now) return hit.value as T;
 
   const ttl = Number(process.env.CACHE_TTL_MINUTES) || opts.ttlMinutes;
   const file = path.join(CACHE_DIR, `${key}.json`);
-  if (opts.disk) {
+  if (opts.disk && !opts.force) {
     try {
       const raw = JSON.parse(await fs.readFile(file, "utf8")) as { expires: number; value: T };
       if (raw.expires > now) {
@@ -52,6 +64,7 @@ export async function cachedFetch<T = unknown>(url: string, opts: FetchOpts): Pr
     }
   }
 
+  if (opts.cacheOnly) throw new CacheMiss();
   const controller = new AbortController();
   const timer = setTimeout(() => controller.abort(), opts.timeoutMs ?? 20000);
   let res: Response;
@@ -60,6 +73,7 @@ export async function cachedFetch<T = unknown>(url: string, opts: FetchOpts): Pr
   } finally {
     clearTimeout(timer);
   }
+  opts.onResponse?.(res);
   if (!res.ok) throw new HttpError(res.status, url);
   const value = (opts.parse === "text" ? await res.text() : await res.json()) as T;
   const entry = { expires: now + ttl * 60_000, value };

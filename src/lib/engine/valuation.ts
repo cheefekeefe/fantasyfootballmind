@@ -30,6 +30,13 @@ export interface ValuationContext {
   nextDraftSeason: number;
   /** Memo for pick values (cleared whenever projected slots change). */
   pickCache: Map<string, number>;
+  /**
+   * Keeper leagues: keeper value of the last player kept league-wide (numTeams x maxKeepers).
+   * Keeping someone only helps by how much he beats what the draft gives you anyway.
+   */
+  keeperLine: number;
+  /** Keeper values of every player, best first (drives keeper-league pick values). */
+  keeperCurve: number[];
 }
 
 export const CONSOLIDATION_EXPONENT = 1.25;
@@ -45,6 +52,11 @@ export function effectivePpg(p: PlayerRecord, ctx: ValuationContext): number {
   const weeks = ctx.regularWeeksLeft + ctx.playoffWeeks;
   if (weeks <= 0) return p.ros.ppg;
   return p.ros.total / weeks;
+}
+
+/** Leagues where next year and beyond matter a lot: dynasty, or keeper leagues keeping a real core. */
+export function isLongHorizon(L: { type: string; maxKeepers: number }): boolean {
+  return L.type === "dynasty" || (L.type === "keeper" && L.maxKeepers >= 5);
 }
 
 /** Share of each flex slot a position typically fills (used to size positional demand). */
@@ -98,6 +110,8 @@ export function buildContext(snap: LeagueSnapshot): ValuationContext {
     projectedSlot: {},
     nextDraftSeason: Math.min(L.season + 1, ...snap.teams.flatMap((t) => t.picks.map((p) => p.season))),
     pickCache: new Map(),
+    keeperLine: 0,
+    keeperCurve: [],
   };
 
   // Replacement = the 3rd-best free agent at each position (what a savvy manager can actually get).
@@ -125,7 +139,54 @@ export function buildContext(snap: LeagueSnapshot): ValuationContext {
     ptsSum += vorp;
   }
   if (ptsSum > 0) ctx.pointsToValue = vSum / ptsSum;
+
+  if (L.type === "keeper" && L.maxKeepers > 0) {
+    ctx.keeperCurve = Object.values(snap.players)
+      .filter((p) => SKILL_POSITIONS.includes(p.position))
+      .map((p) => keeperValue(p, ctx))
+      .sort((a, b) => b - a);
+    ctx.keeperLine = ctx.keeperCurve[Math.min(ctx.keeperCurve.length - 1, L.numTeams * L.maxKeepers - 1)] ?? 0;
+  }
   return ctx;
+}
+
+/**
+ * Next-season worth of a player in a no-cost keeper league: mostly his dynasty market value
+ * (which prices next year and beyond), tempered by this year's production adjusted for age.
+ */
+export function keeperValue(p: PlayerRecord, ctx: ValuationContext): number {
+  if (p.position === "K" || p.position === "DEF") return 0;
+  const dyn = futureValue(p, ctx);
+  const red = p.market.redraft;
+  if (red === null) return dyn;
+  return Math.round(0.7 * dyn + 0.3 * red * ageMultiplier(p.position, p.age === null ? null : p.age + 1));
+}
+
+/**
+ * Choose keepers the way a manager would: best value first, but a keeper beyond what you can
+ * start at a position (e.g. a 3rd QB in a 1QB league) is discounted, because next year you'd
+ * rather spend that slot elsewhere and draft depth.
+ */
+export function selectKeepers(players: PlayerRecord[], ctx: ValuationContext): { p: PlayerRecord; value: number; adjusted: number; surplus: number }[] {
+  const demand = positionalDemand(ctx.snap.league.starterSlots);
+  const count: Partial<Record<Position, number>> = {};
+  const scored = players
+    .filter((p) => p.position !== "K" && p.position !== "DEF")
+    .map((p) => ({ p, value: keeperValue(p, ctx) }))
+    .sort((a, b) => b.value - a.value)
+    .map((x) => {
+      const n = (count[x.p.position] = (count[x.p.position] ?? 0) + 1);
+      const useful = Math.ceil(demand[x.p.position]) + (x.p.position === "QB" || x.p.position === "TE" ? 0 : 1);
+      const factor = n <= useful ? 1 : x.p.position === "QB" || x.p.position === "TE" ? 0.35 : 0.6;
+      const adjusted = Math.round(x.value * factor);
+      return { ...x, adjusted, surplus: Math.max(0, convex(adjusted) - convex(ctx.keeperLine)) };
+    });
+  return scored.sort((a, b) => b.adjusted - a.adjusted);
+}
+
+/** Keeper surplus: how much better than the keeper line (what the draft would hand you). */
+export function keeperSurplus(p: PlayerRecord, ctx: ValuationContext): number {
+  return Math.max(0, convex(keeperValue(p, ctx)) - convex(ctx.keeperLine));
 }
 
 /** Long-term value of a player (dynasty market, else production x age fallback). */
@@ -142,7 +203,7 @@ export function marketValue(p: PlayerRecord, ctx: ValuationContext): number {
   const ros = Math.max(0, p.ros.total - ctx.replacementPpg[p.position] * p.ros.games) * ctx.pointsToValue;
   const redraft = p.market.redraft ?? Math.min(10000, ros);
   if (t === "redraft") return Math.round(redraft);
-  if (t === "keeper") return Math.round(0.6 * redraft + 0.4 * futureValue(p, ctx));
+  if (t === "keeper") return Math.round(0.6 * redraft + 0.4 * keeperValue(p, ctx));
   return Math.round(futureValue(p, ctx));
 }
 
@@ -163,14 +224,16 @@ function computePickValue(pick: DraftPick, ctx: ValuationContext): number {
   const slot = pick.slot ?? (pick.season === ctx.nextDraftSeason ? ctx.projectedSlot[pick.originalRosterId] : undefined);
 
   if (L.type === "keeper") {
-    // A keeper-league pick buys roughly the player available at that spot once keepers are gone.
+    // A keeper-league pick buys the player available at that spot once every team's keepers
+    // are gone; its worth is how much better that player is than a last-round pick.
     const kept = n * L.maxKeepers;
+    const curve = ctx.keeperCurve;
+    if (!curve.length) return 0;
+    const at = (overall: number) => curve[Math.min(curve.length - 1, Math.max(0, Math.round(overall) - 1))] ?? 0;
     const overall = kept + (pick.round - 1) * n + (slot ?? (n + 1) / 2);
-    const ranked = Object.values(ctx.snap.players)
-      .map((p) => p.market.redraft ?? p.market.dynasty ?? 0)
-      .sort((a, b) => b - a);
-    const v = ranked[Math.min(ranked.length - 1, Math.round(overall) - 1)] ?? 0;
-    return Math.round(v * 0.6 * Math.pow(0.9, pick.season - L.season - 1));
+    const lastPick = kept + L.draftRounds * n;
+    const v = Math.max(0, at(overall) - at(lastPick));
+    return Math.round(v * Math.pow(0.85, Math.max(0, pick.season - L.season - 1)));
   }
 
   const rows = ctx.snap.pickValues;

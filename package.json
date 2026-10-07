@@ -9,7 +9,8 @@
     "start": "next start",
     "lint": "tsc --noEmit",
     "test": "vitest run",
-    "demo:build": "tsx scripts/build-demo.ts"
+    "demo:build": "tsx scripts/build-demo.ts",
+    "check-league": "tsx --conditions=react-server scripts/check-league.ts"
   },
   "engines": {
     "node": ">=20"

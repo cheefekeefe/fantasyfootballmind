@@ -15,7 +15,7 @@ import { SKILL_POSITIONS } from "../types";
 import type { LeagueAnalysis, Strategy } from "./analysis";
 import { candidates, ordinal, teamFutureValue, teamNowPoints } from "./analysis";
 import { expectedLineupPoints, optimalLineup } from "./lineup";
-import { convex, effectivePpg, futureValue, marketValue, pickLabel, pickValue, positionalDemand } from "./valuation";
+import { convex, effectivePpg, futureValue, isLongHorizon, marketValue, pickLabel, pickValue, positionalDemand, selectKeepers } from "./valuation";
 
 export type Asset =
   | { kind: "player"; id: string }
@@ -414,7 +414,7 @@ function narrate(an: LeagueAnalysis, s: SideEval, team: Team, w: { now: number; 
   const avgAge = (xs: { a: number; w: number }[]) => xs.reduce((s2, x) => s2 + x.a * x.w, 0) / Math.max(1, xs.reduce((s2, x) => s2 + x.w, 0));
   const gi = ages(s.gets);
   const go = ages(s.gives);
-  if (L.type === "dynasty" && gi.length && go.length) {
+  if (isLongHorizon(L) && gi.length && go.length) {
     const d = avgAge(gi) - avgAge(go);
     if (Math.abs(d) >= 1.5) {
       s.reasons.push(`${d < 0 ? "Gets younger" : "Gets older"} by ${Math.abs(d).toFixed(1)} years (value-weighted)`);
@@ -431,13 +431,15 @@ function narrate(an: LeagueAnalysis, s: SideEval, team: Team, w: { now: number; 
 
   // Keeper logic
   if (L.type === "keeper" && L.maxKeepers > 0) {
-    const keepIds = [...team.players, ...team.reserve, ...team.taxi, ...s.gets.filter((g) => g.asset.kind === "player").map((g) => (g.asset as { id: string }).id)]
-      .filter((id) => !s.gives.some((g) => g.asset.kind === "player" && (g.asset as { id: string }).id === id))
-      .map((id) => ctx.snap.players[id])
-      .filter(Boolean)
-      .sort((a, b) => futureValue(b, ctx) - futureValue(a, ctx))
+    const keepIds = selectKeepers(
+      [...team.players, ...team.reserve, ...team.taxi, ...s.gets.filter((g) => g.asset.kind === "player").map((g) => (g.asset as { id: string }).id)]
+        .filter((id) => !s.gives.some((g) => g.asset.kind === "player" && (g.asset as { id: string }).id === id))
+        .map((id) => ctx.snap.players[id])
+        .filter(Boolean),
+      ctx,
+    )
       .slice(0, L.maxKeepers)
-      .map((p) => p.id);
+      .map((k) => k.p.id);
     for (const g of s.gets) {
       if (g.asset.kind !== "player") continue;
       const id = (g.asset as { id: string }).id;
@@ -446,12 +448,12 @@ function narrate(an: LeagueAnalysis, s: SideEval, team: Team, w: { now: number; 
     for (const g of s.gives) {
       if (g.asset.kind !== "player") continue;
       const id = (g.asset as { id: string }).id;
-      const wasKeeper = [...team.players, ...team.reserve, ...team.taxi]
-        .map((x) => ctx.snap.players[x])
-        .filter(Boolean)
-        .sort((a, b) => futureValue(b, ctx) - futureValue(a, ctx))
+      const wasKeeper = selectKeepers(
+        [...team.players, ...team.reserve, ...team.taxi].map((x) => ctx.snap.players[x]).filter(Boolean),
+        ctx,
+      )
         .slice(0, L.maxKeepers)
-        .some((p) => p.id === id);
+        .some((k) => k.p.id === id);
       if (wasKeeper) s.warnings.push(`${g.label} is currently one of your projected keepers`);
     }
   }

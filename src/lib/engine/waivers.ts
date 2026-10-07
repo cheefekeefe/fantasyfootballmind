@@ -7,7 +7,7 @@ import type { LeagueAnalysis } from "./analysis";
 import { candidates } from "./analysis";
 import { expectedLineupPoints, optimalLineup } from "./lineup";
 import { rosterChangeDelta } from "./trade";
-import { convex, effectivePpg, futureValue } from "./valuation";
+import { convex, effectivePpg, futureValue, keeperSurplus } from "./valuation";
 
 export type WaiverCategory = "plug-and-play" | "upside stash" | "handcuff" | "streamer" | "depth";
 
@@ -98,7 +98,10 @@ export function waiverReport(an: LeagueAnalysis, rosterId: number, w?: { now: nu
       if (category === "depth") category = "handcuff";
       reasons.push(`Handcuff to your starter ${handcuffFor.name}`);
     }
-    if (L.type !== "redraft" && (p.market.dynasty ?? 0) >= 1200 && weekGain < 0.5) {
+    if (L.type === "keeper" && keeperSurplus(p, ctx) > 0) {
+      if (category === "depth") category = "upside stash";
+      reasons.push(`Keeper candidate: projects above your league's keeper line for next season`);
+    } else if (L.type === "dynasty" && (p.market.dynasty ?? 0) >= 1200 && weekGain < 0.5) {
       if (category === "depth") category = "upside stash";
       reasons.push(`Dynasty market value ${p.market.dynasty?.toLocaleString()}: a stash that holds value`);
     }

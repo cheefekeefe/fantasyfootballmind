@@ -7,7 +7,7 @@
 import type { PlayerRecord, Team } from "../types";
 import type { LeagueAnalysis } from "./analysis";
 import { assetKey, evaluateTrade, rosterChangeDelta, viewAsset, type Asset, type EvalOptions, type TradeEvaluation } from "./trade";
-import { convex, effectivePpg, futureValue, marketValue, pickValue } from "./valuation";
+import { convex, effectivePpg, futureValue, isLongHorizon, marketValue, pickValue } from "./valuation";
 
 export interface BlockCandidate {
   playerId: string;
@@ -70,7 +70,7 @@ export function tradeBlock(an: LeagueAnalysis, rosterId: number, w?: { now: numb
 function sellSignals(p: PlayerRecord, an: LeagueAnalysis, window: string): string[] {
   const r: string[] = [];
   const L = an.ctx.snap.league;
-  if (L.type === "dynasty" && p.age) {
+  if (isLongHorizon(L) && p.age) {
     const cliff = p.position === "RB" ? 26.5 : p.position === "WR" ? 29 : p.position === "TE" ? 30 : 33;
     if (p.age >= cliff && (window === "rebuild" || window === "retool")) r.push(`Age ${p.age}: sell before the age cliff while contenders still pay for production`);
   }

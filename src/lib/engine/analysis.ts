@@ -5,7 +5,7 @@
 import type { DraftPick, LeagueSnapshot, PlayerRecord, Position, Team, TeamWindow } from "../types";
 import { SKILL_POSITIONS } from "../types";
 import { expectedLineupPoints, optimalLineup, type LineupCandidate, type LineupResult } from "./lineup";
-import { buildContext, convex, effectivePpg, futureValue, pickValue, positionalDemand, type ValuationContext } from "./valuation";
+import { buildContext, convex, effectivePpg, futureValue, isLongHorizon, pickValue, selectKeepers, positionalDemand, type ValuationContext } from "./valuation";
 
 export interface PositionGroup {
   position: Position;
@@ -66,12 +66,13 @@ const STRATEGY_WEIGHTS: Record<TeamWindow, { now: number; future: number; label:
   rebuild: { now: 0.12, future: 0.88, label: "Rebuilding", posture: "seller" },
 };
 
-export function weightsFor(window: TeamWindow, leagueType: LeagueSnapshot["league"]["type"]): { now: number; future: number } {
+export function weightsFor(window: TeamWindow, leagueType: LeagueSnapshot["league"]["type"], keepers?: number, starters?: number): { now: number; future: number } {
   if (leagueType === "redraft") return { now: 1, future: 0 };
   const w = STRATEGY_WEIGHTS[window];
   if (leagueType === "keeper") {
-    // Keeper leagues: the future only matters through a handful of keeper slots.
-    const future = Math.min(0.4, w.future * 0.5);
+    // Keeper leagues: the future matters in proportion to how much of a lineup you can keep.
+    const share = Math.min(1, (keepers ?? 0) / Math.max(1, starters ?? 9));
+    const future = Math.round(w.future * (0.25 + 0.6 * share) * 100) / 100;
     return { now: 1 - future, future };
   }
   return { now: w.now, future: w.future };
@@ -102,15 +103,12 @@ export function teamNowPoints(ids: string[], ctx: ValuationContext, playoffOdds:
 export function teamFutureValue(ids: string[], picks: DraftPick[], ctx: ValuationContext): number {
   const L = ctx.snap.league;
   if (L.type === "redraft") return 0;
-  const vals = ids
-    .map((id) => ctx.snap.players[id])
-    .filter((p): p is PlayerRecord => Boolean(p))
-    .map((p) => futureValue(p, ctx))
-    .sort((a, b) => b - a);
+  const ps = ids.map((id) => ctx.snap.players[id]).filter((p): p is PlayerRecord => Boolean(p));
   let total = 0;
   if (L.type === "keeper") {
-    for (const v of vals.slice(0, Math.max(0, L.maxKeepers))) total += convex(v);
+    for (const k of selectKeepers(ps, ctx).slice(0, Math.max(0, L.maxKeepers))) total += k.surplus;
   } else {
+    const vals = ps.map((p) => futureValue(p, ctx)).sort((a, b) => b - a);
     const core = L.starterSlots.length + 3;
     vals.forEach((v, i) => {
       const w = i < core ? 1 : Math.max(0.15, Math.pow(0.8, i - core + 1));
@@ -261,7 +259,7 @@ function classify(a: TeamAnalysis, snap: LeagueSnapshot): Strategy {
     reasons.push(`Long-term asset value ranks ${ordinal(a.futureRank)} of ${n}`);
     // Dynasty nuance: an old contender should push chips in now; a young, asset-rich
     // non-contender should retool rather than tear down.
-    if (L.type === "dynasty" && a.coreAge !== null) {
+    if (isLongHorizon(L) && a.coreAge !== null) {
       reasons.push(`Core age ${a.coreAge}`);
       if ((window === "contender" || window === "win-now") && a.coreAge >= 27.3) {
         window = "win-now";
@@ -279,7 +277,7 @@ function classify(a: TeamAnalysis, snap: LeagueSnapshot): Strategy {
   }
   if (L.tradeDeadlineWeek && L.week > L.tradeDeadlineWeek) reasons.push(`Trade deadline (week ${L.tradeDeadlineWeek}) has passed`);
 
-  const w = weightsFor(window, L.type);
+  const w = weightsFor(window, L.type, L.maxKeepers, L.starterSlots.length);
   const base = STRATEGY_WEIGHTS[window];
   const summaries: Record<TeamWindow, string> = {
     contender: "Title favorite. Buy weekly points, consolidate depth into stars, and protect your starters' floors.",

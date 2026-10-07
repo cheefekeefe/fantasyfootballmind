@@ -8,10 +8,12 @@ import * as sleeper from "./sources/sleeper";
 import { getDynastyProcess, getFantasyCalc, getIdMap } from "./sources/values";
 import { getEspnWeekProjections } from "./sources/espn";
 import { getSchedule, getUsage } from "./sources/nflverse";
-import { getGameLines, getPlayerProps, hasOddsKey } from "./sources/odds";
+import { getEvents, getPlayerProps, hasOddsKey, propMarkets, readOddsUsage, type OddsEventInfo } from "./sources/odds";
+import type { SleeperMatchup, SleeperPlayer, SleeperRoster } from "./sources/sleeper";
 import { getFantasyProsRanks, hasFantasyProsKey } from "./sources/fantasypros";
 import { errMessage } from "./http";
-import { loadDemoSnapshot } from "./demo";
+import { normTeam } from "./teams";
+import { DEMO_IDS, loadDemoSnapshot } from "./demo";
 
 async function settle<T>(p: Promise<T>): Promise<{ ok: true; value: T } | { ok: false; error: string }> {
   try {
@@ -26,7 +28,7 @@ const SNAP_TTL_MS = 5 * 60_000;
 
 /** Cached for a few minutes; `force` re-pulls (upstream responses keep their own TTLs). */
 export function loadSnapshot(leagueId: string, myUserId?: string | null, force = false): Promise<LeagueSnapshot> {
-  if (leagueId === "demo") return loadDemoSnapshot();
+  if (DEMO_IDS.includes(leagueId)) return loadDemoSnapshot(leagueId);
   const key = `${leagueId}:${myUserId ?? ""}`;
   const hit = snapCache.get(key);
   if (!force && hit && Date.now() - hit.at < SNAP_TTL_MS) return hit.snap;
@@ -82,30 +84,28 @@ async function loadLive(leagueId: string, myUserId?: string | null): Promise<Lea
       : Promise.resolve({ ok: false as const, error: "add FANTASYPROS_API_KEY to enable" }),
   ]);
 
-  // Vegas: game lines + props for this week's games only (props cost API credits).
-  let lines: Awaited<ReturnType<typeof getGameLines>> | undefined;
-  let props: Awaited<ReturnType<typeof getPlayerProps>> | undefined;
+  // Vegas props: read whatever was pulled on demand (never spends credits on page load).
+  let props: Awaited<ReturnType<typeof getPlayerProps>>["props"] | undefined;
   let oddsStatus: SourceStatus;
   if (hasOddsKey()) {
-    const gl = await settle(getGameLines());
-    if (gl.ok) {
-      lines = gl.value;
-      const horizon = Date.now() + 7 * 864e5;
-      const thisWeek = lines.filter((l) => new Date(l.kickoff).getTime() < horizon);
-      const pr = await settle(getPlayerProps(thisWeek.map((l) => l.eventId)));
-      props = pr.ok ? pr.value : undefined;
-      oddsStatus = {
-        id: "odds",
-        label: "The Odds API (Vegas)",
-        kinds: ["vegas", "projections"],
-        ok: true,
-        requiresKey: true,
-        detail: `${lines.length} games, ${props?.length ?? 0} player props${pr.ok ? "" : ` (props failed: ${pr.error})`}`,
-        fetchedAt: now,
-      };
-    } else oddsStatus = { id: "odds", label: "The Odds API (Vegas)", kinds: ["vegas", "projections"], ok: false, requiresKey: true, detail: gl.error };
+    const scope = await settle(propEventScope({ rosters, players, matchups: matchups[week] ?? [], myUserId }));
+    const pr = scope.ok ? await settle(getPlayerProps(scope.value.map((e) => e.id), false)) : scope;
+    const usage = await readOddsUsage();
+    props = pr.ok ? pr.value.props : undefined;
+    const pulled = usage.lastPull ? `last pull ${new Date(usage.lastPull).toLocaleString()}` : "not pulled yet";
+    oddsStatus = {
+      id: "odds",
+      label: "The Odds API (Vegas player props)",
+      kinds: ["vegas", "projections"],
+      ok: Boolean(props?.length),
+      requiresKey: true,
+      detail: pr.ok
+        ? `${props!.length} props cached for ${pr.value.cached}/${scope.ok ? scope.value.length : 0} games · ${pulled}${usage.remaining !== null ? ` · ${usage.remaining} credits left` : ""}`
+        : `events: ${pr.error}`,
+      fetchedAt: usage.lastPull ?? undefined,
+    };
   } else {
-    oddsStatus = { id: "odds", label: "The Odds API (Vegas props)", kinds: ["vegas", "projections"], ok: false, requiresKey: true, detail: "add ODDS_API_KEY to enable player props" };
+    oddsStatus = { id: "odds", label: "The Odds API (Vegas player props)", kinds: ["vegas", "projections"], ok: false, requiresKey: true, detail: "add ODDS_API_KEY to enable player props" };
   }
 
   const status = (id: SourceStatus["id"], label: string, kinds: SourceStatus["kinds"], r: { ok: boolean; error?: string }, okDetail: string, requiresKey = false): SourceStatus => ({
@@ -148,11 +148,67 @@ async function loadLive(leagueId: string, myUserId?: string | null): Promise<Lea
     idMap: idMap.ok ? idMap.value : undefined,
     schedule: schedule.ok ? schedule.value : undefined,
     usage: usage.ok ? usage.value : undefined,
-    gameLines: lines,
     props,
     fpWeekly: fp.ok ? fp.value : undefined,
     sources,
     myUserId,
   };
   return buildSnapshot(raw);
+}
+
+/**
+ * Which games to pull props for. ODDS_PROPS_SCOPE:
+ *   mine   (default) games with a player on your roster or your opponent's
+ *   league games with any rostered player
+ *   all    every game in the next 7 days
+ */
+async function propEventScope(a: {
+  rosters: SleeperRoster[];
+  players: Record<string, SleeperPlayer>;
+  matchups: SleeperMatchup[];
+  myUserId?: string | null;
+}): Promise<OddsEventInfo[]> {
+  const horizon = Date.now() + 7 * 864e5;
+  const events = (await getEvents()).filter((e) => new Date(e.kickoff).getTime() < horizon);
+  const scope = process.env.ODDS_PROPS_SCOPE ?? "mine";
+  if (scope === "all") return events;
+  let rosters = a.rosters;
+  if (scope !== "league") {
+    const mine = a.rosters.find((r) => r.owner_id === a.myUserId || (r.co_owners ?? []).includes(a.myUserId ?? ""));
+    if (mine) {
+      const mid = a.matchups.find((m) => m.roster_id === mine.roster_id)?.matchup_id;
+      const oppId = a.matchups.find((m) => m.matchup_id === mid && m.roster_id !== mine.roster_id)?.roster_id;
+      rosters = a.rosters.filter((r) => r.roster_id === mine.roster_id || r.roster_id === oppId);
+    }
+  }
+  const teams = new Set<string>();
+  for (const r of rosters) for (const id of r.players ?? []) {
+    const t = normTeam(a.players[id]?.team);
+    if (t) teams.add(t);
+  }
+  return events.filter((e) => teams.has(e.home) || teams.has(e.away));
+}
+
+/** Spend Odds API credits to pull fresh props for the scoped games (POST /api/props). */
+export async function pullProps(leagueId: string, myUserId: string | null): Promise<{ events: number; markets: number; cost: number; props: number }> {
+  const state = await sleeper.getState();
+  const league = await sleeper.getLeague(leagueId);
+  const [rosters, players] = await Promise.all([sleeper.getRosters(leagueId), sleeper.getAllPlayers()]);
+  const week = Number(state.season) === Number(league.season) ? Math.max(1, state.week) : 1;
+  const matchups = await sleeper.getMatchups(leagueId, week).catch(() => []);
+  const events = await propEventScope({ rosters, players, matchups, myUserId });
+  const { props } = await getPlayerProps(events.map((e) => e.id), true);
+  await loadSnapshot(leagueId, myUserId, true);
+  return { events: events.length, markets: propMarkets().length, cost: events.length * propMarkets().length, props: props.length };
+}
+
+/** Estimated credit cost of a pull, without spending anything. */
+export async function propPullEstimate(leagueId: string, myUserId: string | null) {
+  const state = await sleeper.getState();
+  const league = await sleeper.getLeague(leagueId);
+  const [rosters, players] = await Promise.all([sleeper.getRosters(leagueId), sleeper.getAllPlayers()]);
+  const week = Number(state.season) === Number(league.season) ? Math.max(1, state.week) : 1;
+  const matchups = await sleeper.getMatchups(leagueId, week).catch(() => []);
+  const events = await propEventScope({ rosters, players, matchups, myUserId });
+  return { events: events.length, markets: propMarkets().length, cost: events.length * propMarkets().length, usage: await readOddsUsage() };
 }

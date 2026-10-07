@@ -3,6 +3,7 @@
 import { useMemo, useState } from "react";
 import { useLeague } from "@/components/LeagueProvider";
 import { PlayerLine, Section, pct, signed } from "@/components/ui";
+import { PropsPuller } from "@/components/PropsPuller";
 import { adviseLineup } from "@/lib/engine/lineupGuru";
 import type { SourceId } from "@/lib/types";
 
@@ -171,6 +172,9 @@ export default function LineupGuru() {
               })}
             </tbody>
           </table>
+        </div>
+        <div className="mt-3">
+          <PropsPuller />
         </div>
         <p className="mt-2 text-xs text-muted">
           Consensus weights: Vegas props 1.4 · FantasyPros ECR 1.2 · Sleeper 1.0 · ESPN 0.85 (lone outliers trimmed). All points use your league&apos;s scoring. Floor and ceiling are the 20th and 80th

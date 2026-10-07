@@ -8,7 +8,8 @@ let cache: { snap: LeagueSnapshot; an: LeagueAnalysis } | null = null;
 self.onmessage = (e: MessageEvent<{ id: number; snap: LeagueSnapshot; rosterId: number; opts: FindOptions }>) => {
   const { id, snap, rosterId, opts } = e.data;
   try {
-    if (!cache || cache.snap.generatedAt !== snap.generatedAt || cache.snap.league.id !== snap.league.id) cache = { snap, an: analyzeLeague(snap) };
+    const key = (s: LeagueSnapshot) => `${s.league.id}|${s.generatedAt}|${s.league.type}|${s.league.maxKeepers}`;
+    if (!cache || key(cache.snap) !== key(snap)) cache = { snap, an: analyzeLeague(snap) };
     const ideas = findTrades(cache.an, rosterId, opts);
     (self as unknown as Worker).postMessage({ id, ideas });
   } catch (err) {

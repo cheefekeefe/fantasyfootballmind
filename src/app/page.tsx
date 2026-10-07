@@ -37,6 +37,10 @@ export default function Home() {
         <Link className="text-accent underline" href="/league/demo">
           Open the demo dynasty league
         </Link>{" "}
+        or the{" "}
+        <Link className="text-accent underline" href="/league/demo-keeper">
+          10-keeper half-PPR demo
+        </Link>{" "}
         (real players, values, schedule and Vegas lines; simulated rosters).
       </p>
     </div>

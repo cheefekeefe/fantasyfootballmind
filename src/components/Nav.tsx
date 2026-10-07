@@ -16,6 +16,7 @@ export function Nav() {
     ["Trade Central", `${base}/trade`],
     ["Line-Up Guru", `${base}/lineup`],
     ["Waiver Wizard", `${base}/waivers`],
+    ["Keepers", `${base}/keepers`],
     ["Sources", `${base}/sources`],
   ];
   const s = an.teams[rosterId]?.strategy;

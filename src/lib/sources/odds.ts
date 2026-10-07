@@ -1,13 +1,21 @@
-// The Odds API (https://the-odds-api.com) — Vegas game lines and player props.
-// Requires ODDS_API_KEY. Player props are billed per market per event, so responses are
-// cached to disk for several hours; the market list is intentionally small.
+// The Odds API (https://the-odds-api.com): Vegas player props. Requires ODDS_API_KEY.
+//
+// Credits are precious on the free tier (500/month), so:
+//  - the event list comes from the free /events endpoint (0 credits)
+//  - game spreads/totals come from nflverse (free) instead of the Odds API
+//  - props are only pulled when the user clicks "Pull Vegas props" (POST /api/props),
+//    scoped to the games that matter (default: your players + your opponent's), and cached
+//    to disk; normal page loads read that cache and never spend credits.
+// Cost per pull = number of games x number of markets (1 region).
 
+import { promises as fs } from "node:fs";
+import path from "node:path";
 import { cachedFetch } from "../http";
 import { TEAM_FULL_NAMES } from "../teams";
 
 const BASE = "https://api.the-odds-api.com/v4/sports/americanfootball_nfl";
 
-export const PROP_MARKETS = [
+export const ALL_PROP_MARKETS = [
   "player_pass_yds",
   "player_pass_tds",
   "player_pass_interceptions",
@@ -16,7 +24,16 @@ export const PROP_MARKETS = [
   "player_reception_yds",
   "player_anytime_td",
 ] as const;
-export type PropMarket = (typeof PROP_MARKETS)[number];
+export type PropMarket = (typeof ALL_PROP_MARKETS)[number];
+
+/** Highest-signal markets by default; override with ODDS_PROP_MARKETS=comma,separated. */
+const DEFAULT_MARKETS: PropMarket[] = ["player_pass_yds", "player_rush_yds", "player_reception_yds", "player_anytime_td"];
+
+export function propMarkets(): PropMarket[] {
+  const env = process.env.ODDS_PROP_MARKETS?.split(",").map((m) => m.trim()) ?? [];
+  const valid = env.filter((m): m is PropMarket => (ALL_PROP_MARKETS as readonly string[]).includes(m));
+  return valid.length ? valid : DEFAULT_MARKETS;
+}
 
 interface OddsOutcome {
   name: string;
@@ -24,7 +41,7 @@ interface OddsOutcome {
   price: number;
   point?: number;
 }
-interface OddsEvent {
+export interface OddsEvent {
   id: string;
   commence_time: string;
   home_team: string;
@@ -32,14 +49,11 @@ interface OddsEvent {
   bookmakers?: { key: string; markets: { key: string; outcomes: OddsOutcome[] }[] }[];
 }
 
-export interface GameLine {
-  eventId: string;
+export interface OddsEventInfo {
+  id: string;
   kickoff: string;
   home: string;
   away: string;
-  /** Home spread (negative = home favored), consensus median across books. */
-  homeSpread: number | null;
-  total: number | null;
 }
 
 export interface PlayerProp {
@@ -54,6 +68,32 @@ export interface PlayerProp {
 
 export const hasOddsKey = () => Boolean(process.env.ODDS_API_KEY);
 
+const USAGE_FILE = path.join(process.cwd(), ".cache", "odds-usage.json");
+export interface OddsUsage {
+  remaining: number | null;
+  used: number | null;
+  lastPull: string | null;
+  lastPullCost: number | null;
+  events: number;
+}
+
+export async function readOddsUsage(): Promise<OddsUsage> {
+  try {
+    return JSON.parse(await fs.readFile(USAGE_FILE, "utf8")) as OddsUsage;
+  } catch {
+    return { remaining: null, used: null, lastPull: null, lastPullCost: null, events: 0 };
+  }
+}
+
+async function writeOddsUsage(u: OddsUsage) {
+  try {
+    await fs.mkdir(path.dirname(USAGE_FILE), { recursive: true });
+    await fs.writeFile(USAGE_FILE, JSON.stringify(u));
+  } catch {
+    // read-only FS
+  }
+}
+
 const median = (xs: number[]) => {
   if (!xs.length) return null;
   const s = [...xs].sort((a, b) => a - b);
@@ -66,56 +106,66 @@ export function impliedProb(price: number): number {
   return price < 0 ? -price / (-price + 100) : 100 / (price + 100);
 }
 
-export async function getGameLines(): Promise<GameLine[]> {
+/** Upcoming NFL events. This endpoint is free (0 credits). */
+export async function getEvents(): Promise<OddsEventInfo[]> {
   const key = process.env.ODDS_API_KEY;
   if (!key) throw new Error("missing ODDS_API_KEY");
-  const events = await cachedFetch<OddsEvent[]>(
-    `${BASE}/odds?apiKey=${key}&regions=us&markets=spreads,totals&oddsFormat=american`,
-    { ttlMinutes: 120, disk: true },
-  );
-  return events.map((e) => {
-    const spreads: number[] = [];
-    const totals: number[] = [];
-    for (const b of e.bookmakers ?? []) {
-      for (const m of b.markets) {
-        if (m.key === "spreads") {
-          const h = m.outcomes.find((o) => o.name === e.home_team);
-          if (h?.point !== undefined) spreads.push(h.point);
-        } else if (m.key === "totals") {
-          const o = m.outcomes.find((x) => x.name === "Over");
-          if (o?.point !== undefined) totals.push(o.point);
-        }
-      }
-    }
-    return {
-      eventId: e.id,
-      kickoff: e.commence_time,
-      home: TEAM_FULL_NAMES[e.home_team] ?? e.home_team,
-      away: TEAM_FULL_NAMES[e.away_team] ?? e.away_team,
-      homeSpread: median(spreads),
-      total: median(totals),
-    };
-  });
+  const events = await cachedFetch<OddsEvent[]>(`${BASE}/events?apiKey=${key}`, { ttlMinutes: 180, disk: true });
+  return events.map((e) => ({
+    id: e.id,
+    kickoff: e.commence_time,
+    home: TEAM_FULL_NAMES[e.home_team] ?? e.home_team,
+    away: TEAM_FULL_NAMES[e.away_team] ?? e.away_team,
+  }));
 }
 
-/** Fetch props for the given events (normally this week's games). */
-export async function getPlayerProps(eventIds: string[]): Promise<PlayerProp[]> {
+function propsUrl(eventId: string, key: string) {
+  return `${BASE}/events/${eventId}/odds?apiKey=${key}&regions=us&markets=${propMarkets().join(",")}&oddsFormat=american`;
+}
+
+/**
+ * Props for the given events. With `spend: false` (normal page loads) only cached pulls are
+ * returned and no credits are used.
+ */
+export async function getPlayerProps(eventIds: string[], spend: boolean): Promise<{ props: PlayerProp[]; cached: number }> {
   const key = process.env.ODDS_API_KEY;
   if (!key) throw new Error("missing ODDS_API_KEY");
-  const markets = PROP_MARKETS.join(",");
+  let remaining: number | null = null;
+  let used: number | null = null;
   const results = await Promise.allSettled(
     eventIds.map((id) =>
-      cachedFetch<OddsEvent>(`${BASE}/events/${id}/odds?apiKey=${key}&regions=us&markets=${markets}&oddsFormat=american`, {
-        ttlMinutes: 360,
+      cachedFetch<OddsEvent>(propsUrl(id, key), {
+        ttlMinutes: 60 * 24 * 4, // lines for a game stay useful until kickoff; re-pull on demand
         disk: true,
+        cacheOnly: !spend,
+        force: spend,
+        onResponse: (res) => {
+          const r = Number(res.headers.get("x-requests-remaining"));
+          const u = Number(res.headers.get("x-requests-used"));
+          if (Number.isFinite(r)) remaining = remaining === null ? r : Math.min(remaining, r);
+          if (Number.isFinite(u)) used = used === null ? u : Math.max(used, u);
+        },
       }),
     ),
   );
   const props: PlayerProp[] = [];
+  let cached = 0;
   for (const r of results) {
-    if (r.status === "fulfilled") props.push(...aggregateProps(r.value));
+    if (r.status === "fulfilled") {
+      cached++;
+      props.push(...aggregateProps(r.value));
+    }
   }
-  return props;
+  if (spend) {
+    await writeOddsUsage({
+      remaining,
+      used,
+      lastPull: new Date().toISOString(),
+      lastPullCost: eventIds.length * propMarkets().length,
+      events: eventIds.length,
+    });
+  }
+  return { props, cached };
 }
 
 /** Collapse every book's outcomes into one consensus line + no-vig probability per player/market. */
@@ -124,8 +174,7 @@ export function aggregateProps(event: OddsEvent): PlayerProp[] {
   for (const b of event.bookmakers ?? []) {
     for (const m of b.markets) {
       const market = m.key as PropMarket;
-      if (!PROP_MARKETS.includes(market)) continue;
-      // Group this book's outcomes by player.
+      if (!ALL_PROP_MARKETS.includes(market)) continue;
       const byPlayer = new Map<string, OddsOutcome[]>();
       for (const o of m.outcomes) {
         const player = o.description ?? o.name;
